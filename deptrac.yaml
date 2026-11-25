@@ -1,0 +1,45 @@
+# Hexagonal mimari kuralları. Çalıştırmak için: vendor/bin/deptrac analyse
+#
+#   Domain          → hiçbir şeye bağımlı olamaz (Symfony/Doctrine dahil)
+#   Application     → yalnızca Domain'e
+#   Infrastructure  → Application, Domain ve framework'lere
+#
+# Bir sınıf yanlış yöne bağımlılık eklerse komut hata verir ve CI kırmızı olur.
+deptrac:
+  paths:
+    - ./src
+  exclude_files:
+    - '#.*Kernel\.php#'
+
+  layers:
+    - name: Domain
+      collectors:
+        - type: directory
+          value: src/Domain/.*
+
+    - name: Application
+      collectors:
+        - type: directory
+          value: src/Application/.*
+
+    - name: Infrastructure
+      collectors:
+        - type: directory
+          value: src/Infrastructure/.*
+        # Test verisi de bir adaptördür: domain'i portlar üzerinden kurar
+        - type: directory
+          value: src/DataFixtures/.*
+
+    - name: Framework
+      collectors:
+        - type: classNameRegex
+          value: '#^(Symfony|Doctrine|Lexik|Psr)\\#'
+
+  ruleset:
+    Domain: ~
+    Application:
+      - Domain
+    Infrastructure:
+      - Application
+      - Domain
+      - Framework

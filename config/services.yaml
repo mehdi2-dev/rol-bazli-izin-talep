@@ -18,6 +18,15 @@ services:
     # this creates a service per class whose id is the fully-qualified class name
     App\:
         resource: '../src/'
+        exclude:
+            - '../src/Domain/'          # domain nesneleri servis değildir
+            - '../src/Kernel.php'
+
+    # Portlar (Application\Port) → adaptörler (Infrastructure)
+    App\Application\Port\LeaveRequestRepository: '@App\Infrastructure\Persistence\Doctrine\DoctrineLeaveRequestRepository'
+    App\Application\Port\UserRepository: '@App\Infrastructure\Persistence\Doctrine\DoctrineUserRepository'
+    App\Application\Port\PasswordHasher: '@App\Infrastructure\Security\SymfonyPasswordHasher'
+    App\Application\Port\Clock: '@App\Infrastructure\Clock\SystemClock'
 
     # add more service definitions when explicit configuration is needed
     # please note that last definitions always *replace* previous ones

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop, 'refactor/**']
+  pull_request:
+
+jobs:
+  backend:
+    name: Backend (test + mimari kontrol)
+    runs-on: ubuntu-latest
+    env:
+      APP_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: intl, pdo_sqlite, sodium
+          coverage: none
+
+      - name: Composer paketleri
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: JWT anahtarları (yalnızca test için)
+        run: php bin/console lexik:jwt:generate-keypair --skip-if-exists
+
+      - name: Testler (API + birim)
+        run: php bin/phpunit
+
+      - name: Mimari kurallar (Deptrac)
+        run: vendor/bin/deptrac analyse --no-progress

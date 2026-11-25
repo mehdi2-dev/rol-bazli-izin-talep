@@ -1,14 +1,13 @@
 security:
     # Şifreleme ayarları (PasswordEncoder / PasswordHasher)
     password_hashers:
-        App\Entity\User: 'auto'
+        App\Infrastructure\Security\SecurityUser: 'auto'
 
     providers:
         # Veritabanından kullanıcı yükleme sağlayıcısı
+        # Kullanıcılar UserRepository portu üzerinden yüklenir (Infrastructure/Security)
         app_user_provider:
-            entity:
-                class: App\Entity\User
-                property: email
+            id: App\Infrastructure\Security\SecurityUserProvider
 
     firewalls:
         dev:

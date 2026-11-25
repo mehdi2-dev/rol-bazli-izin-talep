@@ -2,6 +2,10 @@
 
 namespace App\EventSubscriber;
 
+use App\Domain\Exception\AccessDenied;
+use App\Domain\Exception\Conflict;
+use App\Domain\Exception\DomainException;
+use App\Domain\Exception\NotFound;
 use Symfony\Component\EventDispatcher\EventSubscriberInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Response;
@@ -15,6 +19,7 @@ use Symfony\Component\HttpKernel\KernelEvents;
  * /api altındaki istekler için:
  *  - Nuxt frontend'in (farklı port) API'ye erişebilmesi için CORS başlıkları
  *  - Hataların HTML sayfa yerine JSON olarak dönmesi
+ *  - Domain kural ihlallerinin (Domain\Exception) HTTP durum koduna çevrilmesi
  */
 class ApiSubscriber implements EventSubscriberInterface
 {
@@ -70,7 +75,15 @@ class ApiSubscriber implements EventSubscriberInterface
 
         $exception = $event->getThrowable();
 
-        if ($exception instanceof HttpExceptionInterface) {
+        if ($exception instanceof DomainException) {
+            $status = match (true) {
+                $exception instanceof NotFound => 404,
+                $exception instanceof AccessDenied => 403,
+                $exception instanceof Conflict => 409,
+                default => 400,
+            };
+            $message = $exception->getMessage();
+        } elseif ($exception instanceof HttpExceptionInterface) {
             $status = $exception->getStatusCode();
             $message = match ($status) {
                 403 => 'Bu işlem için yetkiniz yok.',

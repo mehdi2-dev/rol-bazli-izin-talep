@@ -2,63 +2,54 @@
 
 namespace App\Controller;
 
-use App\Entity\User;
-use App\Repository\UserRepository;
-use Doctrine\ORM\EntityManagerInterface;
+use App\Application\Port\PasswordHasher;
+use App\Application\Port\UserRepository;
+use App\Domain\Exception\AccessDenied;
+use App\Domain\User\User;
+use App\Infrastructure\Http\Presenter\UserPresenter;
+use App\Infrastructure\Security\SecurityUser;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
-use Symfony\Component\PasswordHasher\Hasher\UserPasswordHasherInterface;
 use Symfony\Component\Routing\Attribute\Route;
 use Symfony\Component\Security\Http\Attribute\IsGranted;
 
+/** ROL-24 ara durum: domain User ve portlar kullanılıyor; ROL-25'te use case'lere taşınacak. */
 #[Route('/api')]
 class UserController extends AbstractController
 {
-    /** Giriş yapan kullanıcının bilgileri (frontend dashboard için). */
+    public function __construct(
+        private UserRepository $users,
+        private PasswordHasher $hasher,
+    ) {
+    }
+
     #[Route('/me', name: 'app_me', methods: ['GET'])]
     #[IsGranted('ROLE_USER')]
     public function me(): JsonResponse
     {
-        /** @var User $user */
-        $user = $this->getUser();
-
-        return $this->json($this->userToArray($user));
+        return $this->json(UserPresenter::toArray($this->currentUser()));
     }
 
-    /** Kullanıcı yönetimi: yöneticinin ekibindeki kullanıcılar. */
     #[Route('/admin/users', name: 'app_admin_users', methods: ['GET'])]
     #[IsGranted('ROLE_ADMIN')]
-    public function list(UserRepository $userRepository): JsonResponse
+    public function list(): JsonResponse
     {
-        /** @var User $manager */
-        $manager = $this->getUser();
+        $department = $this->currentUser()->department();
 
-        if (!$manager->getDepartment()) {
-            return $this->json([]);
-        }
-
-        $users = $userRepository->findBy(['department' => $manager->getDepartment()], ['email' => 'ASC']);
-
-        return $this->json(array_map(fn (User $u) => $this->userToArray($u), $users));
+        return $this->json($department === null ? [] : UserPresenter::list($this->users->findByDepartment($department)));
     }
 
-    /** Kullanıcı yönetimi: yöneticinin ekibine yeni çalışan ekleme. */
     #[Route('/admin/users', name: 'app_admin_create_user', methods: ['POST'])]
     #[IsGranted('ROLE_ADMIN')]
-    public function create(
-        Request $request,
-        UserRepository $userRepository,
-        EntityManagerInterface $entityManager,
-        UserPasswordHasherInterface $hasher
-    ): JsonResponse {
-        /** @var User $manager */
-        $manager = $this->getUser();
+    public function create(Request $request): JsonResponse
+    {
+        $manager = $this->currentUser();
         $parameters = json_decode($request->getContent(), true) ?? [];
 
         $email = strtolower(trim((string) ($parameters['email'] ?? '')));
         $password = (string) ($parameters['password'] ?? '');
-        $balance = $parameters['leaveBalance'] ?? 14;
+        $balance = $parameters['leaveBalance'] ?? User::DEFAULT_BALANCE;
 
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
             return $this->json(['error' => 'Geçerli bir e-posta adresi girin.'], 400);
@@ -68,72 +59,54 @@ class UserController extends AbstractController
             return $this->json(['error' => 'Şifre en az 6 karakter olmalıdır.'], 400);
         }
 
-        if (!is_int($balance) || $balance < 0 || $balance > 60) {
+        if (!is_int($balance) || $balance < User::MIN_BALANCE || $balance > User::MAX_BALANCE) {
             return $this->json(['error' => 'İzin bakiyesi 0 ile 60 arasında bir tam sayı olmalıdır.'], 400);
         }
 
-        if ($userRepository->findOneBy(['email' => $email])) {
+        if ($this->users->findByEmail($email) !== null) {
             return $this->json(['error' => 'Bu e-posta ile kayıtlı bir kullanıcı zaten var.'], 409);
         }
 
-        $user = new User();
-        $user->setEmail($email);
-        $user->setRoles(['ROLE_USER']);
-        $user->setDepartment($manager->getDepartment());
-        $user->setLeaveBalance($balance);
-        $user->setPassword($hasher->hashPassword($user, $password));
-
-        $entityManager->persist($user);
-        $entityManager->flush();
+        $user = User::create($email, $this->hasher->hash($password), $manager->department(), $balance);
+        $this->users->save($user);
 
         return $this->json([
             'message' => 'Kullanıcı oluşturuldu.',
-            'user' => $this->userToArray($user),
+            'user' => UserPresenter::toArray($user),
         ], 201);
     }
 
-    /** Kullanıcı yönetimi: ekipteki çalışanın izin bakiyesini güncelleme. */
     #[Route('/admin/users/{id}', name: 'app_admin_update_user', methods: ['PATCH'], requirements: ['id' => '\d+'])]
     #[IsGranted('ROLE_ADMIN')]
-    public function update(int $id, Request $request, UserRepository $userRepository, EntityManagerInterface $entityManager): JsonResponse
+    public function update(int $id, Request $request): JsonResponse
     {
-        /** @var User $manager */
-        $manager = $this->getUser();
-        $user = $userRepository->find($id);
+        $user = $this->users->get($id);
 
-        if (!$user) {
-            return $this->json(['error' => 'Kullanıcı bulunamadı.'], 404);
-        }
-
-        if (!$manager->getDepartment() || $user->getDepartment()?->getId() !== $manager->getDepartment()->getId()) {
-            return $this->json(['error' => 'Bu kullanıcı sizin ekibinizde değil.'], 403);
+        if (!$this->currentUser()->isInSameTeamAs($user)) {
+            throw new AccessDenied('Bu kullanıcı sizin ekibinizde değil.');
         }
 
         $parameters = json_decode($request->getContent(), true) ?? [];
         $balance = $parameters['leaveBalance'] ?? null;
 
-        if (!is_int($balance) || $balance < 0 || $balance > 60) {
+        if (!is_int($balance)) {
             return $this->json(['error' => 'İzin bakiyesi 0 ile 60 arasında bir tam sayı olmalıdır.'], 400);
         }
 
-        $user->setLeaveBalance($balance);
-        $entityManager->flush();
+        $user->changeLeaveBalance($balance);
+        $this->users->save($user);
 
         return $this->json([
             'message' => 'Kullanıcı güncellendi.',
-            'user' => $this->userToArray($user),
+            'user' => UserPresenter::toArray($user),
         ]);
     }
 
-    private function userToArray(User $user): array
+    private function currentUser(): User
     {
-        return [
-            'id' => $user->getId(),
-            'email' => $user->getEmail(),
-            'roles' => $user->getRoles(),
-            'isManager' => $user->isManager(),
-            'department' => $user->getDepartment()?->getName(),
-            'leaveBalance' => $user->getLeaveBalance(),
-        ];
+        /** @var SecurityUser $securityUser */
+        $securityUser = $this->getUser();
+
+        return $securityUser->user();
     }
 }

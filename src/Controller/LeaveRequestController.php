@@ -2,45 +2,46 @@
 
 namespace App\Controller;
 
-use App\Entity\LeaveRequest;
-use App\Entity\User;
-use App\Repository\LeaveRequestRepository;
-use Doctrine\ORM\EntityManagerInterface;
+use App\Application\Port\Clock;
+use App\Application\Port\LeaveRequestRepository;
+use App\Domain\Leave\LeavePeriod;
+use App\Domain\Leave\LeaveRequest;
+use App\Domain\Leave\LeaveStatus;
+use App\Domain\User\User;
+use App\Infrastructure\Http\Presenter\LeavePresenter;
+use App\Infrastructure\Security\SecurityUser;
 use Symfony\Bundle\FrameworkBundle\Controller\AbstractController;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\Routing\Attribute\Route;
 use Symfony\Component\Security\Http\Attribute\IsGranted;
 
+/**
+ * ROL-24 ara durum: iş kuralları artık Domain\Leave\LeaveRequest içinde.
+ * Kural ihlalleri domain exception olarak fırlar; ApiSubscriber bunları JSON hataya çevirir.
+ * ROL-25'te bu sınıf use case'leri çağıran ince bir adaptöre dönüşecek.
+ */
 #[Route('/api')]
 class LeaveRequestController extends AbstractController
 {
-    // ---------------------------------------------------------------
-    // ÇALIŞAN: kendi izinleri (ROL-9)
-    // ---------------------------------------------------------------
+    public function __construct(
+        private LeaveRequestRepository $leaves,
+        private Clock $clock,
+    ) {
+    }
 
-    /** Kural: Çalışan sadece kendi izinlerini görebilir. */
     #[Route('/leaves', name: 'app_my_leaves', methods: ['GET'])]
     #[IsGranted('ROLE_USER')]
-    public function getMyLeaves(LeaveRequestRepository $leaveRequestRepository): JsonResponse
+    public function getMyLeaves(): JsonResponse
     {
-        /** @var User $user */
-        $user = $this->getUser();
-
-        $leaves = $leaveRequestRepository->findBy(['user' => $user], ['startDate' => 'DESC']);
-
-        return $this->json(array_map(fn (LeaveRequest $l) => $l->toArray(), $leaves));
+        return $this->json(LeavePresenter::list($this->leaves->findByEmployee($this->currentUser())));
     }
 
     #[Route('/leaves', name: 'app_create_leave', methods: ['POST'])]
     #[IsGranted('ROLE_USER')]
-    public function createLeave(
-        Request $request,
-        EntityManagerInterface $entityManager,
-        LeaveRequestRepository $leaveRequestRepository
-    ): JsonResponse {
-        /** @var User $user */
-        $user = $this->getUser();
+    public function createLeave(Request $request): JsonResponse
+    {
+        $employee = $this->currentUser();
         $parameters = json_decode($request->getContent(), true) ?? [];
 
         $startRaw = $parameters['startDate'] ?? null;
@@ -58,188 +59,100 @@ class LeaveRequestController extends AbstractController
             return $this->json(['error' => 'Tarih formatı geçersiz. Beklenen format: YYYY-MM-DD.'], 400);
         }
 
-        if ($endDate < $startDate) {
-            return $this->json(['error' => 'Bitiş tarihi başlangıç tarihinden önce olamaz.'], 400);
-        }
-
-        $today = new \DateTime('today');
-        if ($startDate < $today) {
-            return $this->json(['error' => 'Geçmiş tarihli izin talebi oluşturulamaz.'], 400);
-        }
-
-        $days = LeaveRequest::countWorkingDays($startDate, $endDate);
-        if ($days === 0) {
-            return $this->json(['error' => 'Seçilen aralıkta iş günü yok (yalnızca hafta sonu).'], 400);
-        }
-
-        if ($days > $user->getLeaveBalance()) {
-            return $this->json([
-                'error' => sprintf('Yetersiz izin bakiyesi. Talep: %d gün, kalan: %d gün.', $days, $user->getLeaveBalance()),
-            ], 400);
-        }
-
-        if ($leaveRequestRepository->findOverlapping($user, $startDate, $endDate)) {
-            return $this->json(['error' => 'Bu tarihlerle çakışan bekleyen veya onaylanmış bir izin talebiniz var.'], 409);
-        }
-
-        $leaveRequest = new LeaveRequest();
-        $leaveRequest->setUser($user);
-        $leaveRequest->setStartDate($startDate);
-        $leaveRequest->setEndDate($endDate);
-        $leaveRequest->setReason($reason);
-        $leaveRequest->setStatus(LeaveRequest::STATUS_PENDING);
-
-        $entityManager->persist($leaveRequest);
-        $entityManager->flush();
+        $period = new LeavePeriod($startDate, $endDate);
+        $leave = LeaveRequest::submit(
+            $employee,
+            $period,
+            $reason,
+            $this->clock->now(),
+            $this->leaves->hasOverlapping($employee, $period),
+        );
+        $this->leaves->save($leave);
 
         return $this->json([
             'message' => 'İzin talebi başarıyla oluşturuldu.',
-            'id' => $leaveRequest->getId(),
-            'leave' => $leaveRequest->toArray(),
+            'id' => $leave->id(),
+            'leave' => LeavePresenter::toArray($leave),
         ], 201);
     }
 
-    // ---------------------------------------------------------------
-    // YÖNETİCİ: ekibin izinleri, onay / ret (ROL-10)
-    // ---------------------------------------------------------------
-
-    /** Kural: Yönetici yalnızca kendi ekibinin (departmanının) bekleyen taleplerini görür. */
     #[Route('/admin/leaves/pending', name: 'app_admin_pending_leaves', methods: ['GET'])]
     #[IsGranted('ROLE_ADMIN')]
-    public function getPendingLeaves(LeaveRequestRepository $leaveRequestRepository): JsonResponse
+    public function getPendingLeaves(): JsonResponse
     {
-        /** @var User $manager */
-        $manager = $this->getUser();
+        $department = $this->currentUser()->department();
 
-        if (!$manager->getDepartment()) {
-            return $this->json([]);
-        }
-
-        $leaves = $leaveRequestRepository->findByDepartment($manager->getDepartment(), LeaveRequest::STATUS_PENDING);
-
-        return $this->json(array_map(fn (LeaveRequest $l) => $l->toArray(), $leaves));
+        return $this->json($department === null ? [] : LeavePresenter::list(
+            $this->leaves->findByDepartment($department, LeaveStatus::Pending),
+        ));
     }
 
     /** Ekibin tüm talepleri (geçmiş dahil). ?status=approved gibi filtrelenebilir. */
     #[Route('/admin/leaves', name: 'app_admin_team_leaves', methods: ['GET'])]
     #[IsGranted('ROLE_ADMIN')]
-    public function getTeamLeaves(Request $request, LeaveRequestRepository $leaveRequestRepository): JsonResponse
+    public function getTeamLeaves(Request $request): JsonResponse
     {
-        /** @var User $manager */
-        $manager = $this->getUser();
-
-        if (!$manager->getDepartment()) {
+        $department = $this->currentUser()->department();
+        if ($department === null) {
             return $this->json([]);
         }
 
-        $status = $request->query->get('status');
-        $leaves = $leaveRequestRepository->findByDepartment($manager->getDepartment(), $status ?: null);
+        $statusRaw = $request->query->get('status');
+        $status = $statusRaw ? LeaveStatus::tryFrom($statusRaw) : null;
+        if ($statusRaw && $status === null) {
+            return $this->json([]);  // bilinmeyen durum: eşleşen talep yok
+        }
 
-        return $this->json(array_map(fn (LeaveRequest $l) => $l->toArray(), $leaves));
+        return $this->json(LeavePresenter::list($this->leaves->findByDepartment($department, $status)));
     }
 
     #[Route('/admin/leaves/{id}/approve', name: 'app_admin_approve_leave', methods: ['PATCH'], requirements: ['id' => '\d+'])]
     #[IsGranted('ROLE_ADMIN')]
-    public function approve(int $id, EntityManagerInterface $entityManager): JsonResponse
+    public function approve(int $id): JsonResponse
     {
-        $leaveRequest = $entityManager->getRepository(LeaveRequest::class)->find($id);
-
-        $error = $this->checkManagerCanDecide($leaveRequest);
-        if ($error) {
-            return $error;
-        }
-
-        $employee = $leaveRequest->getUser();
-        $days = $leaveRequest->getWorkingDays();
-
-        if ($days > $employee->getLeaveBalance()) {
-            return $this->json([
-                'error' => sprintf('Çalışanın bakiyesi yetersiz. Talep: %d gün, kalan: %d gün.', $days, $employee->getLeaveBalance()),
-            ], 400);
-        }
-
-        $employee->setLeaveBalance($employee->getLeaveBalance() - $days);
-        $leaveRequest->setStatus(LeaveRequest::STATUS_APPROVED);
-        $entityManager->flush();
+        $leave = $this->leaves->get($id);
+        $leave->approve($this->currentUser());
+        $this->leaves->save($leave);
 
         return $this->json([
             'message' => 'İzin talebi onaylandı.',
-            'leave' => $leaveRequest->toArray(),
-            'remainingBalance' => $employee->getLeaveBalance(),
+            'leave' => LeavePresenter::toArray($leave),
+            'remainingBalance' => $leave->employee()->leaveBalance(),
         ]);
     }
 
-    /** Kural: Reddedilen izinlerde açıklama girilmelidir. */
     #[Route('/admin/leaves/{id}/reject', name: 'app_admin_reject_leave', methods: ['PATCH'], requirements: ['id' => '\d+'])]
     #[IsGranted('ROLE_ADMIN')]
-    public function reject(int $id, Request $request, EntityManagerInterface $entityManager): JsonResponse
+    public function reject(int $id, Request $request): JsonResponse
     {
-        $leaveRequest = $entityManager->getRepository(LeaveRequest::class)->find($id);
-
-        $error = $this->checkManagerCanDecide($leaveRequest);
-        if ($error) {
-            return $error;
-        }
-
         $parameters = json_decode($request->getContent(), true) ?? [];
-        $reason = trim((string) ($parameters['reason'] ?? ''));
 
-        if ($reason === '') {
-            return $this->json(['error' => 'Ret işleminde açıklama zorunludur.'], 400);
-        }
-
-        $leaveRequest->setStatus(LeaveRequest::STATUS_REJECTED);
-        $leaveRequest->setRejectionReason($reason);
-        $entityManager->flush();
+        $leave = $this->leaves->get($id);
+        $leave->reject($this->currentUser(), (string) ($parameters['reason'] ?? ''));
+        $this->leaves->save($leave);
 
         return $this->json([
             'message' => 'İzin talebi reddedildi.',
-            'leave' => $leaveRequest->toArray(),
+            'leave' => LeavePresenter::toArray($leave),
         ]);
     }
 
-    // ---------------------------------------------------------------
-    // Yardımcılar
-    // ---------------------------------------------------------------
-
-    /**
-     * Kural: Yönetici sadece kendi ekibinin izinlerini onaylayabilir/reddedebilir.
-     * Sorun yoksa null, varsa hata cevabı döner.
-     */
-    private function checkManagerCanDecide(?LeaveRequest $leaveRequest): ?JsonResponse
+    private function currentUser(): User
     {
-        if (!$leaveRequest) {
-            return $this->json(['error' => 'İzin talebi bulunamadı.'], 404);
-        }
+        /** @var SecurityUser $securityUser */
+        $securityUser = $this->getUser();
 
-        /** @var User $manager */
-        $manager = $this->getUser();
-        $employee = $leaveRequest->getUser();
-
-        if ($employee === $manager) {
-            return $this->json(['error' => 'Kendi izin talebinizi onaylayamaz veya reddedemezsiniz.'], 403);
-        }
-
-        $managerDept = $manager->getDepartment();
-        if (!$managerDept || $employee->getDepartment()?->getId() !== $managerDept->getId()) {
-            return $this->json(['error' => 'Bu talep sizin ekibinize ait değil.'], 403);
-        }
-
-        if ($leaveRequest->getStatus() !== LeaveRequest::STATUS_PENDING) {
-            return $this->json(['error' => 'Bu talep zaten sonuçlandırılmış.'], 400);
-        }
-
-        return null;
+        return $securityUser->user();
     }
 
-    private function parseDate(mixed $value): ?\DateTime
+    private function parseDate(mixed $value): ?\DateTimeImmutable
     {
         if (!is_string($value)) {
             return null;
         }
 
-        $date = \DateTime::createFromFormat('!Y-m-d', $value);
-        $errors = \DateTime::getLastErrors();
+        $date = \DateTimeImmutable::createFromFormat('!Y-m-d', $value);
+        $errors = \DateTimeImmutable::getLastErrors();
 
         if (!$date || ($errors && ($errors['warning_count'] > 0 || $errors['error_count'] > 0))) {
             return null;

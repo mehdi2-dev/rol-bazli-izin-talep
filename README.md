@@ -4,7 +4,7 @@
 
 | Katman | Teknoloji | Klasör | Adres |
 |---|---|---|---|
-| Backend (REST API) | PHP 8.2+, Symfony 7.4, Doctrine ORM, LexikJWT | kök klasör (`src/`, `config/`) | http://127.0.0.1:8000/api |
+| Backend (REST API) | PHP 8.2+, Symfony 7.4, Doctrine ORM, LexikJWT, hexagonal mimari | kök klasör (`src/`, `config/`) | http://127.0.0.1:8000/api |
 | Frontend | Nuxt 3, TypeScript, Pinia, Tailwind CSS | `frontend/` | http://localhost:3000 |
 | Veritabanı | MariaDB / MySQL | — | `leave_db` |
 
@@ -84,16 +84,62 @@ Giriş dışındaki tüm istekler `Authorization: Bearer <token>` başlığı is
 
 Hatalar JSON döner: `{"error": "..."}` ve durum kodu (400, 401, 403, 404, 409, 500).
 
+## Mimari: hexagonal (ports & adapters)
+
+Backend, iş kurallarını framework'ten ayıran **hexagonal mimariyle** yazılmıştır. Bağımlılıklar her zaman **dıştan içe** doğrudur:
+
+```mermaid
+flowchart LR
+    subgraph Infrastructure["Infrastructure (adaptörler)"]
+        HTTP["Http/Controller<br/>giren adaptör"]
+        DB["Persistence/Doctrine<br/>çıkan adaptör"]
+        SEC["Security, Clock"]
+    end
+    subgraph Application["Application"]
+        UC["UseCase<br/>izin oluştur, onayla, reddet…"]
+        PORT["Port<br/>LeaveRequestRepository, UserRepository,<br/>PasswordHasher, Clock"]
+    end
+    subgraph Domain["Domain"]
+        D["LeaveRequest, LeavePeriod, User<br/>iş kuralları"]
+    end
+    HTTP --> UC
+    UC --> D
+    UC --> PORT
+    DB -. uygular .-> PORT
+    SEC -. uygular .-> PORT
+```
+
+| Katman | Klasör | Ne içerir | Neye bağımlı olabilir |
+|---|---|---|---|
+| **Domain** | `src/Domain` | `LeaveRequest` (submit / approve / reject), `LeavePeriod` (iş günü, çakışma), `User`, `Department`, kural hataları | Hiçbir şeye (Symfony ve Doctrine yok) |
+| **Application** | `src/Application` | `UseCase/*` (her işlem bir sınıf), `Port/*` (arayüzler) | Domain |
+| **Infrastructure** | `src/Infrastructure` | İnce controller'lar, Doctrine repository'leri ve XML eşlemeleri, güvenlik adaptörü, JSON dönüştürücüler, hata → HTTP durum kodu | Application, Domain, framework'ler |
+
+Bir isteğin yolu: `HTTP → Controller → UseCase → Domain kuralları → Port → Doctrine → MariaDB`.
+
+- **Domain Doctrine'i bilmez:** veritabanı eşlemeleri `src/Infrastructure/Persistence/Doctrine/Mapping/*.orm.xml` dosyalarındadır.
+- **Kural ihlalleri** domain exception olarak fırlar (`ValidationFailed` → 400, `AccessDenied` → 403, `NotFound` → 404, `Conflict` → 409); `Infrastructure/Http/EventSubscriber/ApiSubscriber` bunları JSON hataya çevirir.
+- **Kurallar otomatik kontrol edilir:** [`deptrac.yaml`](deptrac.yaml) katmanlar arası izinli bağımlılıkları tanımlar; yanlış yöne bir bağımlılık eklenirse `vendor/bin/deptrac analyse` ve CI hata verir.
+
 ## Proje yapısı
 
 ```
 src/
-  Controller/       LeaveRequestController, UserController (API uç noktaları)
-  Entity/           User, LeaveRequest, Department (veritabanı tabloları)
-  Repository/       Özel sorgular (çakışma kontrolü, ekibe göre listeleme)
-  EventSubscriber/  ApiSubscriber (CORS, JSON hata cevapları)
-  DataFixtures/     Test verisi
+  Domain/
+    Leave/          LeaveRequest, LeavePeriod, LeaveStatus
+    User/           User, Department
+    Exception/      ValidationFailed, AccessDenied, NotFound, Conflict
+  Application/
+    Port/           LeaveRequestRepository, UserRepository, PasswordHasher, Clock
+    UseCase/        Leave/ (Submit, Approve, Reject, ListMy, ListTeam), User/ (AddTeamMember, ChangeLeaveBalance, ListTeamMembers)
+  Infrastructure/
+    Http/           Controller/ (ince API uç noktaları), Presenter/ (JSON), EventSubscriber/ (CORS, hata → JSON)
+    Persistence/    Doctrine repository'leri ve XML eşlemeleri
+    Security/       SecurityUser, SecurityUserProvider, SymfonyPasswordHasher
+    Clock/          SystemClock
+  DataFixtures/     Test verisi (domain kurallarından geçerek oluşturulur)
 config/packages/security.yaml   JWT girişi ve rol bazlı erişim kuralları
+deptrac.yaml                    Mimari kurallar
 frontend/
   pages/            login, dashboard, izin oluştur, izinlerim, yönetici onay, kullanıcı yönetimi
   stores/auth.ts    Token ve kullanıcı bilgisi (Pinia)
@@ -102,5 +148,18 @@ frontend/
 ```
 
 ## Test
+
+```bash
+php bin/phpunit              # 78 test: API + birim
+vendor/bin/deptrac analyse   # mimari kurallar
+```
+
+| Test grubu | Klasör | Ne doğrular | Gereken |
+|---|---|---|---|
+| API testleri | `tests/Api` | Tüm uç noktalar: giriş ve yetki, izin kuralları, onay/ret, kullanıcı yönetimi | SQLite (her test sıfırdan kurulur, MariaDB'ye dokunmaz) |
+| Domain testleri | `tests/Unit/Domain` | İş günü hesabı, bakiye, çakışma, onay yetkisi | Hiçbir şey |
+| Use case testleri | `tests/Unit/Application` | Use case'ler, bellek içi sahte adaptörlerle (`tests/Support`) | Hiçbir şey |
+
+GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) her push'ta testleri ve Deptrac'ı çalıştırır.
 
 Manuel test senaryoları (32 senaryo), Postman koleksiyonu ve bulunan hatalar test dokümanında yer alır.

@@ -1,6 +1,6 @@
 <?php
 
-namespace App\EventSubscriber;
+namespace App\Infrastructure\Http\EventSubscriber;
 
 use App\Domain\Exception\AccessDenied;
 use App\Domain\Exception\Conflict;
